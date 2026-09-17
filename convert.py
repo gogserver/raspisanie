@@ -1,4 +1,4 @@
-# convert.py — читает СТАРЫЙ .xls через xlrd
+# convert.py — с эвристикой: общие пары копируются обеим группам
 import xlrd, json, re, io
 
 XLS = "4_uif.xls"
@@ -16,7 +16,6 @@ DAY_MAP = {
 
 def clean(v):
     if v is None: return ""
-    # Числовые 0 (int/float) — пусто
     if isinstance(v, (int, float)) and float(v) == 0:
         return ""
     s = str(v).strip()
@@ -27,18 +26,11 @@ def clean(v):
     return "" if s in ("0", "0.0") else s
 
 def norm_num(v):
-    """'3301.0' → '3301'"""
     s = str(v).strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-    return s
+    return s[:-2] if s.endswith(".0") else s
 
 def parse_date_cell(val, datemode):
-    """Распознаёт дату Excel: число 46265, '46265', '46265.0',
-       ISO '2026-08-31' или '31.08.2026'."""
-    if val is None or val == "":
-        return None
-    # Число Excel
+    if val is None or val == "": return None
     try:
         num = float(str(val).strip())
         dt = xlrd.xldate_as_datetime(num, datemode)
@@ -46,61 +38,83 @@ def parse_date_cell(val, datemode):
             return dt.strftime("%Y-%m-%d")
     except (ValueError, TypeError):
         pass
-    # ISO-строка
     m = re.match(r'(\d{4})-(\d{2})-(\d{2})', str(val))
-    if m:
-        return m.group(0)
-    # ДД.ММ.ГГГГ
+    if m: return m.group(0)
     m = re.match(r'(\d{2})\.(\d{2})\.(\d{4})', str(val))
-    if m:
-        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    if m: return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
     return None
 
 wb = xlrd.open_workbook(XLS)
 ws = wb.sheet_by_index(0)
-rows = [[ws.cell_value(r, c) for c in range(ws.ncols)] for r in range(ws.nrows)]
+nrows, ncols = ws.nrows, ws.ncols
+
+def cell(r, c):
+    return ws.cell_value(r, c) if r < nrows and c < ncols else ""
 
 data = {g: {} for g in GROUPS}
 current_day, current_dates, current_pair = None, [], None
 
-for row in rows:
-    # День недели
-    if row[0]:
-        cell = str(row[0]).replace(" ", "").strip().upper()
-        if cell in DAY_MAP:
-            current_day = DAY_MAP[cell]
+for r in range(nrows):
+    v0 = cell(r, 0)
+    if v0:
+        t = str(v0).replace(" ", "").strip().upper()
+        if t in DAY_MAP:
+            current_day = DAY_MAP[t]
             current_pair = None
 
-    # Строка "Числа месяца"
-    if row[0] and "Числа" in str(row[0]):
+    if v0 and "Числа" in str(v0):
         current_dates = []
-        for j in range(4, min(21, len(row))):
-            iso = parse_date_cell(row[j], wb.datemode)
+        for c in range(4, ncols):
+            iso = parse_date_cell(cell(r, c), wb.datemode)
             if iso:
-                current_dates.append(iso)
+                current_dates.append((c, iso))
         continue
 
-    # Строки с парами
-    group_val = norm_num(row[2]) if row[2] else ""
-    if group_val in GROUPS:
-        g = group_val
-        pv = norm_num(row[1]) if row[1] else ""
+    g = norm_num(cell(r, 2)) if cell(r, 2) else ""
+    if g in GROUPS:
+        pv = norm_num(cell(r, 1)) if cell(r, 1) else ""
+        row_pair = None
         if pv in PAIRS:
+            row_pair = pv
             current_pair = pv
-        if current_pair and current_day and current_dates:
-            for j, iso in enumerate(current_dates):
-                idx = 4 + j
-                txt = clean(row[idx] if idx < len(row) else None)
-                if not txt: continue
+        else:
+            TIME_TO_PAIR = {"8.30":"1","10.00":"2","11.30":"3","14.20":"4","15.50":"5","17.20":"6"}
+            for prefix, num in TIME_TO_PAIR.items():
+                if pv.startswith(prefix):
+                    row_pair = num
+                    break
+
+        if row_pair and current_day and current_dates:
+            for col, iso in current_dates:
+                txt = clean(cell(r, col))
+                if not txt:
+                    continue
                 if iso not in data[g]:
                     y, m_, d = iso.split("-")
                     data[g][iso] = {
-                        "date": f"{d}.{m_}.{y}",
-                        "iso": iso,
-                        "day": current_day,
+                        "date": f"{d}.{m_}.{y}", "iso": iso, "day": current_day,
                         "lessons": {p: "" for p in PAIRS},
                     }
-                data[g][iso]["lessons"][current_pair] = txt
+                data[g][iso]["lessons"][row_pair] = txt
+
+# === ЭВРИСТИКА ОБЩИХ ПАР ===
+# Для каждой даты и пары: если у одной группы есть, а у другой пусто → копируем
+for iso in set().union(*[set(data[g].keys()) for g in GROUPS]):
+    for p in PAIRS:
+        vals = {g: data[g].get(iso, {}).get("lessons", {}).get(p, "") for g in GROUPS}
+        filled = {g: v for g, v in vals.items() if v}
+        if len(filled) == 1:
+            src_g, src_v = next(iter(filled.items()))
+            for dst_g in GROUPS:
+                if dst_g == src_g: continue
+                if iso not in data[dst_g]:
+                    y, m_, d = iso.split("-")
+                    data[dst_g][iso] = {
+                        "date": f"{d}.{m_}.{y}", "iso": iso,
+                        "day": data[src_g][iso]["day"],
+                        "lessons": {pp: "" for pp in PAIRS},
+                    }
+                data[dst_g][iso]["lessons"][p] = src_v
 
 out = {g: sorted(data[g].values(), key=lambda x: x["iso"]) for g in GROUPS}
 
@@ -109,10 +123,13 @@ with io.open("new_data.js", "w", encoding="utf-8") as f:
     f.write("const GROUPS = " + json.dumps(GROUPS, ensure_ascii=False) + ";\n")
 
 print("OK → new_data.js")
-print("Записей:", {g: len(v) for g, v in out.items()})
-# Показать первую запись для проверки
+print("Дней:", {g: len(v) for g, v in out.items()})
+print("Пар всего:", {g: sum(1 for e in v for pp in e['lessons'] if e['lessons'][pp]) for g, v in out.items()})
+
+# Проверка 17.09
 for g in GROUPS:
-    if out[g]:
-        first = out[g][0]
-        print(f"Первая запись {g}: {first['date']} ({first['day']}), пар: "
-              f"{sum(1 for v in first['lessons'].values() if v)}")
+    for e in out[g]:
+        if e['iso'] == '2026-09-17':
+            print(f"\n{g} {e['date']} ({e['day']}):")
+            for pp in PAIRS:
+                print(f"  пара {pp}: {e['lessons'].get(pp, '')[:70]}")
